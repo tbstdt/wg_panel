@@ -1,0 +1,9 @@
+# секреты и данные сервера — не коммитить
+*.key
+*.conf
+clients/
+keys.env
+*.env
+panel_settings.json
+traffic_stats.json*
+__pycache__/

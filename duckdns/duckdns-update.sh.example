@@ -1,0 +1,17 @@
+#!/bin/sh
+# DuckDNS updater. Run by duckdns.timer and by the panel's "Update IP" button.
+# DuckDNS takes the IP from the request itself when ip= is empty;
+# verbose=true makes it return "OK\n<ip>\n..." so the IP can be logged.
+DOMAIN="your-subdomain"
+TOKEN="your-duckdns-token"
+
+RESP=$(wget -q -T 20 -O - "https://www.duckdns.org/update?domains=$DOMAIN&token=$TOKEN&ip=&verbose=true")
+STATUS=$(echo "$RESP" | sed -n 1p)
+IP=$(echo "$RESP" | sed -n 2p)
+
+if [ "$STATUS" = "OK" ]; then
+    echo "DuckDNS $DOMAIN -> $IP"
+else
+    echo "DuckDNS update failed: ${STATUS:-no response}" >&2
+    exit 1
+fi
