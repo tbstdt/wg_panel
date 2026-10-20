@@ -496,21 +496,30 @@ def get_charge_limit():
 
     stop = value(config, "STOP", value(status, "stop_percent", 80))
     resume = value(config, "RESUME", value(status, "resume_percent", 75))
+    capacity = int_or_none(read_sysfs("/sys/class/power_supply/battery/capacity"))
     isus = read_sysfs("/sys/class/power_supply/battery/input_suspend")
     bce = read_sysfs("/sys/class/power_supply/battery/battery_charging_enabled")
-    hard_stop = isus == "1"
-    blocked = hard_stop or bce == "0"
+    mode = status.get("mode")
+    if not active:
+        state = "disabled"
+    elif mode in ("charging", "holding", "draining", "hard_stop", "idle"):
+        state = mode
+    elif isus == "1":
+        state = "draining" if capacity is not None and capacity > stop else "hard_stop"
+    elif bce == "0":
+        state = "holding"
+    else:
+        state = "charging"
+    blocked = state in ("holding", "draining", "hard_stop")
     full = int_or_none(status.get("charge_full_uAh"))
     if full is None:
         full = int_or_none(read_sysfs("/sys/class/power_supply/bms/charge_full"))
     target = int(stop * full / 100 / 1000) if full else None
-    state = "disabled"
-    if active:
-        state = "stopped" if blocked else "charging"
     return {
         "enabled": active,
         "blocked": blocked,
-        "hard_stop": hard_stop,
+        "draining": state == "draining",
+        "hard_stop": state == "hard_stop",
         "stop": stop,
         "resume": resume,
         "target_mah": target,
@@ -1243,7 +1252,9 @@ function pollBattery() {
     const lim = d.limit || {};
     let limitText = '--';
     if (!lim.enabled) limitText = 'выключен';
-    else if (lim.hard_stop) limitText = 'стоп (жёсткий)';
+    else if (lim.state === 'draining') limitText = 'разряд до лимита';
+    else if (lim.state === 'hard_stop') limitText = 'стоп (жёсткий)';
+    else if (lim.state === 'idle') limitText = 'ожидание';
     else if (lim.blocked) limitText = 'стоп';
     else limitText = 'разрешён';
     set('batLimitState', limitText);
