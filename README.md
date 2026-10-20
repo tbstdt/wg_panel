@@ -40,6 +40,10 @@
 - Системный монитор: CPU, load average, память, скорость `wg0`, uptime,
   заряд и температура батареи, температура CPU
 - Настройка Endpoint (обновляет его во всех клиентских конфигах)
+- Галочка **Obfuscation** — добавляет в клиентские конфиги параметры
+  AmneziaWG (`Jc/Jmin/Jmax`, `S1-S4`, `H1-H4`, `I1`). Применяется ко всем
+  существующим и новым клиентам; заголовки и паддинги берутся из
+  серверного конфига, junk-параметры — клиентские
 - Кнопка обновления IP в DuckDNS
 
 ## Требования
@@ -121,6 +125,11 @@ journalctl -u awg-panel -f
 | `SERVER_CONF` | `/userdata/wg-panel/wg0-native.conf` | Конфиг, из которого поднимается `wg0`; панель записывает в него пиров |
 | `DUCKDNS_SCRIPT` | `/usr/local/bin/duckdns-update.sh` | Скрипт DuckDNS |
 
+`panel_settings.json` хранит `endpoint` и `obfuscation` (bool). Включение
+`obfuscation` переписывает `client.conf` всех клиентов, добавляя AWG-параметры;
+отключение убирает их. Клиенты должны заново импортировать конфиг, чтобы
+AmneziaVPN начал использовать обфускацию.
+
 ## Хранение данных
 
 Данные лежат на `/userdata`: корневая ФС смонтирована только для чтения.
@@ -132,7 +141,7 @@ journalctl -u awg-panel -f
 ```
 /userdata/wg-panel/
 ├── server_public.key         # публичный ключ сервера (для клиентских конфигов)
-├── panel_settings.json       # {"endpoint": "host:port"}
+├── panel_settings.json       # {"endpoint": "host:port", "obfuscation": false}
 ├── traffic_stats.json        # трафик за месяц
 └── clients/
     └── <имя>/

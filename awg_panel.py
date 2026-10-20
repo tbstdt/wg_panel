@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import shutil
 import threading
+import random
 
 # kept on /userdata: the root filesystem is mounted read-only
 CONFIG_DIR = "/userdata/wg-panel"
@@ -23,6 +24,14 @@ ONLINE_TIMEOUT = 180  # a peer with a handshake newer than this is "connected"
 SERVER_CONF = os.path.join(CONFIG_DIR, "wg0-native.conf")
 WEB_PORT = 8080
 DUCKDNS_SCRIPT = "/usr/local/bin/duckdns-update.sh"
+
+# AmneziaWG client-side obfuscation. Junk packets are sender-side only, so
+# the client gets its own Jc/Jmin/Jmax; headers and paddings must match the
+# server and are copied from SERVER_CONF when present.
+AWG_CONF_KEYS = ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
+                 "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5")
+AWG_DEFAULT_I1 = ("<r 2><b 0x858000010001000000000669636c6f756403636f6d"
+                  "0000010001c00c000100010000105a00044d583737>")
 
 
 def run_cmd(cmd, timeout=20):
@@ -59,6 +68,68 @@ def save_settings(data):
     os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
     with open(SETTINGS_FILE, "w") as f:
         json.dump(data, f)
+
+
+def server_awg_params():
+    """AWG interface parameters currently configured on the server."""
+    params = {}
+    try:
+        with open(SERVER_CONF) as f:
+            in_interface = False
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("["):
+                    in_interface = stripped == "[Interface]"
+                    continue
+                if in_interface and "=" in stripped:
+                    key, value = (x.strip() for x in stripped.split("=", 1))
+                    if key in AWG_CONF_KEYS:
+                        params[key] = value
+    except OSError:
+        pass
+    return params
+
+
+def build_obfuscation_block():
+    """Client-side AWG parameters compatible with the running server.
+
+    Junk is sent only by the client (as recommended by AmneziaWG), while
+    paddings and magic headers must be identical on both sides.
+    """
+    server = server_awg_params()
+    lines = [f"Jc = {random.randint(4, 6)}", "Jmin = 10", "Jmax = 50"]
+    for key in ("S1", "S2", "S3", "S4"):
+        lines.append(f"{key} = {server.get(key, '0')}")
+    for i, key in enumerate(("H1", "H2", "H3", "H4"), start=1):
+        lines.append(f"{key} = {server.get(key, str(i))}")
+    lines.append(f"I1 = {server.get('I1', AWG_DEFAULT_I1)}")
+    return "\n".join(lines) + "\n"
+
+
+def apply_obfuscation_to_config(content, enabled):
+    """Add or remove AWG parameters in a client config."""
+    pattern = r'^(?:' + "|".join(AWG_CONF_KEYS) + r')\s*=.*\n?'
+    content = re.sub(pattern, "", content, flags=re.M)
+    if enabled:
+        block = build_obfuscation_block()
+        if "\n[Peer]" in content:
+            content = content.replace("\n[Peer]", "\n" + block + "\n[Peer]", 1)
+        else:
+            content = content.rstrip("\n") + "\n" + block
+    return re.sub(r"\n{3,}", "\n\n", content)
+
+
+def apply_obfuscation_all(enabled):
+    for name in get_clients():
+        path = os.path.join(CLIENTS_DIR, name, "client.conf")
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            content = f.read()
+        updated = apply_obfuscation_to_config(content, enabled)
+        if updated != content:
+            with open(path, "w") as f:
+                f.write(updated)
 
 
 def generate_qr_svg(text):
@@ -534,6 +605,8 @@ Endpoint = {endpoint}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 """
+    if load_settings().get("obfuscation"):
+        config = apply_obfuscation_to_config(config, True)
     with open(os.path.join(client_dir, "client.conf"), "w") as f:
         f.write(config)
 
@@ -773,6 +846,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <button class="btn btn-primary btn-sm" onclick="saveEndpoint()">Save</button>
     </div>
     <div class="settings-row" style="margin-top:12px;border-top:1px solid #334155;padding-top:12px">
+      <label>Obfuscation:</label>
+      <div style="flex:1;display:flex;align-items:center;gap:8px;color:#e2e8f0;font-size:14px">
+        <input type="checkbox" id="obfuscationInput" OBFUSCATION_CHECKED style="width:18px;height:18px;accent-color:#3b82f6;flex:none">
+        <span>Enable WireGuard obfuscation (AmneziaWG) in client configs</span>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="saveObfuscation()">Save</button>
+    </div>
+    <div class="settings-row" style="margin-top:12px;border-top:1px solid #334155;padding-top:12px">
       <label>DuckDNS:</label>
       <div style="flex:1;font-family:monospace;font-size:13px;color:#64748b" id="duckStatus">IP: loading...</div>
       <button class="btn btn-success btn-sm" onclick="updateDuckDNS()" id="duckBtn">Update IP</button>
@@ -880,6 +961,19 @@ function saveEndpoint() {
     body: JSON.stringify({endpoint: val})
   }).then(r => r.json()).then(d => {
     showToast('Endpoint saved: ' + val);
+  });
+}
+
+function saveObfuscation() {
+  const enabled = document.getElementById('obfuscationInput').checked;
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({obfuscation: enabled})
+  }).then(r => r.json()).then(d => {
+    showToast(enabled ? 'Obfuscation enabled for all client configs'
+                      : 'Obfuscation disabled for all client configs');
+    setTimeout(() => location.reload(), 700);
   });
 }
 
@@ -1061,6 +1155,8 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
         html = HTML_TEMPLATE
         html = html.replace("ENDPOINT_DISPLAY", settings.get("endpoint") or "не задан")
         html = html.replace("ENDPOINT_VAL", settings.get("endpoint", ""))
+        html = html.replace("OBFUSCATION_CHECKED",
+                            "checked" if settings.get("obfuscation") else "")
         html = html.replace("CLIENT_LIST_HTML", client_html)
         html = html.replace("PEER_COUNT", str(len(clients)))
 
@@ -1152,6 +1248,11 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
         if "endpoint" in data:
             settings["endpoint"] = data["endpoint"]
             update_endpoint_all(data["endpoint"])
+        if "obfuscation" in data:
+            enabled = bool(data["obfuscation"])
+            if enabled != bool(settings.get("obfuscation")):
+                apply_obfuscation_all(enabled)
+            settings["obfuscation"] = enabled
         save_settings(settings)
         self.json_response({"ok": True, "settings": settings})
 
