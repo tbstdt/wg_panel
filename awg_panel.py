@@ -24,6 +24,10 @@ ONLINE_TIMEOUT = 180  # a peer with a handshake newer than this is "connected"
 SERVER_CONF = os.path.join(CONFIG_DIR, "wg0-native.conf")
 WEB_PORT = 8080
 DUCKDNS_SCRIPT = "/usr/local/bin/duckdns-update.sh"
+CHARGE_LIMIT_STATUS = "/run/charge-limit/status"
+CHARGE_LIMIT_CONF = "/userdata/charge-limit.conf"
+CHARGE_LIMIT_CONF_FALLBACK = "/etc/charge-limit.conf"
+CHARGE_LIMIT_SERVICE = "charge-limit.service"
 
 # AmneziaWG client-side obfuscation. Junk packets are sender-side only, so
 # the client gets its own Jc/Jmin/Jmax; headers and paddings must match the
@@ -395,16 +399,139 @@ def read_sysfs(path):
         return None
 
 
+def int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_battery():
     base = "/sys/class/power_supply/battery"
     cap = read_sysfs(f"{base}/capacity")
     temp = read_sysfs(f"{base}/temp")  # tenths of a degree
     status = read_sysfs(f"{base}/status")
+    current = read_sysfs(f"{base}/current_now")
+    voltage = read_sysfs(f"{base}/voltage_now")
+    current_ma = None
+    if current and current.lstrip("-").isdigit():
+        current_ma = round(int(current) / 1000, 1)
+    if current_ma is None:
+        state = "unknown"
+    elif current_ma < -50:
+        state = "charging"
+    elif current_ma > 50:
+        state = "discharging"
+    else:
+        state = "idle"
     return {
         "percent": int(cap) if cap and cap.isdigit() else None,
         "status": status or "?",
         "temp": round(int(temp) / 10, 1) if temp and temp.lstrip("-").isdigit() else None,
+        "current_ma": current_ma,
+        "voltage_v": round(int(voltage) / 1000000, 2) if voltage and voltage.isdigit() else None,
+        "usb_present": int_or_none(read_sysfs("/sys/class/power_supply/usb/present")),
+        "usb_online": int_or_none(read_sysfs("/sys/class/power_supply/usb/online")),
+        "state": state,
     }
+
+
+def get_battery_health():
+    base = "/sys/class/power_supply/bms"
+    full = int_or_none(read_sysfs(f"{base}/charge_full"))
+    design = int_or_none(read_sysfs(f"{base}/charge_full_design"))
+    cycles = int_or_none(read_sysfs(f"{base}/cycle_count"))
+    soh = round(100.0 * full / design, 1) if full and design else None
+    return {
+        "soh_percent": soh,
+        "cycles": cycles,
+        "full_mah": round(full / 1000) if full else None,
+        "design_mah": round(design / 1000) if design else None,
+    }
+
+
+def read_key_values(path):
+    data = {}
+    try:
+        with open(path) as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                data[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return data
+
+
+def charge_limit_active():
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", CHARGE_LIMIT_SERVICE],
+            timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def charge_limit_config():
+    for path in (CHARGE_LIMIT_CONF, CHARGE_LIMIT_CONF_FALLBACK):
+        data = read_key_values(path)
+        if data:
+            return data
+    return {}
+
+
+def get_charge_limit():
+    active = charge_limit_active()
+    status = read_key_values(CHARGE_LIMIT_STATUS)
+    config = charge_limit_config()
+
+    def value(mapping, key, default):
+        try:
+            return int(mapping.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    stop = value(config, "STOP", value(status, "stop_percent", 80))
+    resume = value(config, "RESUME", value(status, "resume_percent", 75))
+    isus = read_sysfs("/sys/class/power_supply/battery/input_suspend")
+    bce = read_sysfs("/sys/class/power_supply/battery/battery_charging_enabled")
+    hard_stop = isus == "1"
+    blocked = hard_stop or bce == "0"
+    full = int_or_none(status.get("charge_full_uAh"))
+    if full is None:
+        full = int_or_none(read_sysfs("/sys/class/power_supply/bms/charge_full"))
+    target = int(stop * full / 100 / 1000) if full else None
+    state = "disabled"
+    if active:
+        state = "stopped" if blocked else "charging"
+    return {
+        "enabled": active,
+        "blocked": blocked,
+        "hard_stop": hard_stop,
+        "stop": stop,
+        "resume": resume,
+        "target_mah": target,
+        "state": state,
+    }
+
+
+def write_charge_limit_config(stop, resume):
+    config = charge_limit_config()
+    poll = config.get("POLL", "10")
+    fallback = config.get("FALLBACK", "1")
+    fallback_ma = config.get("FALLBACK_MA", "150")
+    os.makedirs(os.path.dirname(CHARGE_LIMIT_CONF), exist_ok=True)
+    temporary = CHARGE_LIMIT_CONF + ".tmp"
+    with open(temporary, "w") as handle:
+        handle.write("STOP=%d\n" % stop)
+        handle.write("RESUME=%d\n" % resume)
+        handle.write("POLL=%s\n" % poll)
+        handle.write("FALLBACK=%s\n" % fallback)
+        handle.write("FALLBACK_MA=%s\n" % fallback_ma)
+    os.replace(temporary, CHARGE_LIMIT_CONF)
 
 
 def get_cpu_temp():
@@ -757,6 +884,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .settings-row{display:flex;gap:10px;align-items:center;margin-bottom:10px}
 .settings-row label{min-width:100px;color:#94a3b8;font-size:14px}
 .settings-row input{flex:1;padding:8px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;font-size:14px}
+.settings-row input.limit-input{flex:none;width:80px}
 .modal-btns{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
 .progress-bar{height:6px;background:#334155;border-radius:3px;margin-top:6px;overflow:hidden}
 .progress-bar .fill{height:100%;border-radius:3px;transition:width .5s ease}
@@ -836,6 +964,57 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
         <div class="sys-value" id="sysUptime">--</div>
       </div>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>Батарея и лимит заряда</h2>
+    <div class="status-grid">
+      <div class="status-item">
+        <div class="sys-label">Ресурс (SoH)</div>
+        <div class="sys-value" id="batSoh">--</div>
+        <div class="sys-sub" id="batWear">износ --</div>
+      </div>
+      <div class="status-item">
+        <div class="sys-label">Циклы</div>
+        <div class="sys-value" id="batCycles">--</div>
+      </div>
+      <div class="status-item">
+        <div class="sys-label">Ёмкость</div>
+        <div class="sys-value" id="batFull">--</div>
+        <div class="sys-sub" id="batDesign">проект. --</div>
+      </div>
+      <div class="status-item">
+        <div class="sys-label">Ток / напряжение</div>
+        <div class="sys-value" id="batCurrent">--</div>
+        <div class="sys-sub" id="batState">--</div>
+      </div>
+      <div class="status-item">
+        <div class="sys-label">Лимит заряда</div>
+        <div class="sys-value" id="batLimitState">--</div>
+        <div class="sys-sub" id="batThresholds">--</div>
+      </div>
+      <div class="status-item">
+        <div class="sys-label">Цель</div>
+        <div class="sys-value" id="batTarget">--</div>
+        <div class="sys-sub">при пороге отключения</div>
+      </div>
+    </div>
+    <div class="settings-row" style="margin-top:16px;border-top:1px solid #334155;padding-top:16px">
+      <label>Ограничивать заряд:</label>
+      <div style="flex:1;display:flex;align-items:center;gap:8px;color:#e2e8f0;font-size:14px">
+        <input type="checkbox" id="batLimitEnabled" onchange="toggleBatteryLimit()" style="width:18px;height:18px;accent-color:#3b82f6;flex:none">
+        <span>останавливать заряд на пороге</span>
+      </div>
+    </div>
+    <div class="settings-row" style="margin-top:10px">
+      <label>Стоп / старт:</label>
+      <input class="limit-input" type="number" id="batStop" min="50" max="100" value="80">
+      <span style="color:#64748b">% /</span>
+      <input class="limit-input" type="number" id="batResume" min="5" max="99" value="75">
+      <span style="color:#64748b">%</span>
+      <button class="btn btn-primary btn-sm" onclick="saveBatteryLimit()">Сохранить</button>
+    </div>
+    <div class="sys-sub" style="margin-top:8px">новые пороги применяются в течение 10 секунд</div>
   </div>
 
   <div class="card">
@@ -1037,6 +1216,83 @@ function setBarColor(el, pct) {
   el.className = 'fill ' + (pct >= 85 ? 'red' : pct >= 60 ? 'yellow' : 'green');
 }
 
+function showToast(message) {
+  const toast = document.getElementById('toast');
+  toast.textContent = message;
+  toast.style.display = 'block';
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => { toast.style.display = 'none'; }, 2500);
+}
+
+function pollBattery() {
+  fetch('/api/battery').then(r => r.json()).then(d => {
+    const set = (id, value) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    };
+    set('batSoh', d.soh_percent == null ? '--' : d.soh_percent + '%');
+    set('batWear', d.soh_percent == null ? 'износ --' : 'износ ' + (100 - d.soh_percent).toFixed(1) + '%');
+    set('batCycles', d.cycles == null ? '--' : d.cycles);
+    set('batFull', d.full_mah == null ? '--' : d.full_mah + ' mAh');
+    set('batDesign', d.design_mah == null ? 'проект. --' : 'проект. ' + d.design_mah + ' mAh');
+    set('batCurrent', d.current_ma == null ? '--' : Math.abs(d.current_ma).toFixed(0) + ' mA'
+        + (d.voltage_v == null ? '' : ' / ' + d.voltage_v + ' V'));
+    set('batState', d.state === 'charging' ? 'заряд'
+        : d.state === 'discharging' ? 'разряд'
+        : d.state === 'idle' ? 'покой' : '--');
+    const lim = d.limit || {};
+    let limitText = '--';
+    if (!lim.enabled) limitText = 'выключен';
+    else if (lim.hard_stop) limitText = 'стоп (жёсткий)';
+    else if (lim.blocked) limitText = 'стоп';
+    else limitText = 'разрешён';
+    set('batLimitState', limitText);
+    set('batThresholds', (lim.stop == null ? '--' : 'стоп ' + lim.stop + '%')
+        + ' · ' + (lim.resume == null ? '--' : 'старт ' + lim.resume + '%'));
+    set('batTarget', lim.target_mah == null ? '--' : lim.target_mah + ' mAh');
+    const sohEl = document.getElementById('batSoh');
+    if (sohEl) sohEl.style.color = d.soh_percent == null ? ''
+        : d.soh_percent < 70 ? '#ef4444' : d.soh_percent < 85 ? '#f59e0b' : '#22c55e';
+    const enabledEl = document.getElementById('batLimitEnabled');
+    if (enabledEl) enabledEl.checked = !!lim.enabled;
+    const stopEl = document.getElementById('batStop');
+    const resumeEl = document.getElementById('batResume');
+    if (stopEl && document.activeElement !== stopEl && lim.stop != null) stopEl.value = lim.stop;
+    if (resumeEl && document.activeElement !== resumeEl && lim.resume != null) resumeEl.value = lim.resume;
+  }).catch(() => {});
+}
+
+function saveBatteryLimit() {
+  const stop = parseInt(document.getElementById('batStop').value, 10);
+  const resume = parseInt(document.getElementById('batResume').value, 10);
+  if (!Number.isFinite(stop) || !Number.isFinite(resume)) {
+    alert('Введите пороги');
+    return;
+  }
+  fetch('/api/battery', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({stop: stop, resume: resume})
+  }).then(r => r.json()).then(d => {
+    if (d.error) { alert(d.error); pollBattery(); return; }
+    showToast('Пороги: ' + stop + '% / ' + resume + '%');
+    pollBattery();
+  }).catch(() => alert('Ошибка сохранения'));
+}
+
+function toggleBatteryLimit() {
+  const enabled = document.getElementById('batLimitEnabled').checked;
+  fetch('/api/battery', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: enabled})
+  }).then(r => r.json()).then(d => {
+    if (d.error) { alert(d.error); pollBattery(); return; }
+    showToast(enabled ? 'Лимит заряда включён' : 'Лимит заряда выключен');
+    pollBattery();
+  }).catch(() => { pollBattery(); });
+}
+
 function pollSystem() {
   fetch('/api/system').then(r => r.json()).then(d => {
     document.getElementById('sysCpu').textContent = d.cpu_percent + '%';
@@ -1061,8 +1317,13 @@ function pollSystem() {
     const batBar = document.getElementById('batBar');
     batBar.style.width = (bat.percent || 0) + '%';
     batBar.className = 'fill ' + (bat.percent <= 15 ? 'red' : bat.percent <= 40 ? 'yellow' : 'green');
+    const stateText = bat.state === 'charging' ? 'заряд'
+                    : bat.state === 'discharging' ? 'разряд'
+                    : bat.state === 'idle' ? 'покой' : '';
     document.getElementById('sysBatDetail').textContent =
-      bat.status + (bat.temp == null ? '' : ' · ' + bat.temp + ' °C');
+      bat.status + (bat.temp == null ? '' : ' · ' + bat.temp + ' °C')
+      + (bat.current_ma == null ? '' : ' · ' + Math.abs(bat.current_ma).toFixed(0) + ' mA')
+      + (stateText ? ' · ' + stateText : '');
 
     const ct = document.getElementById('sysCpuTemp');
     ct.textContent = d.cpu_temp == null ? '--' : d.cpu_temp + ' °C';
@@ -1073,9 +1334,11 @@ function pollSystem() {
 window.addEventListener('load', () => {
   loadDuckStatus();
   pollSystem();
+  pollBattery();
   pollTraffic();
   setInterval(pollTraffic, 10000);
   setInterval(pollSystem, 3000);
+  setInterval(pollBattery, 5000);
 });
 </script>
 </body>
@@ -1111,11 +1374,15 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             self.handle_traffic()
         elif self.path.startswith('/api/system'):
             self.handle_system()
+        elif self.path.startswith('/api/battery'):
+            self.handle_battery()
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path.startswith('/api/settings'):
+        if self.path.startswith('/api/battery'):
+            self.handle_battery_post()
+        elif self.path.startswith('/api/settings'):
             self.handle_settings()
         else:
             self.send_error(404)
@@ -1213,6 +1480,59 @@ class PanelHandler(http.server.BaseHTTPRequestHandler):
             "battery": get_battery(),
             "cpu_temp": get_cpu_temp()
         })
+
+    def handle_battery(self):
+        data = get_battery()
+        data.update(get_battery_health())
+        data["limit"] = get_charge_limit()
+        self.json_response(data)
+
+    def handle_battery_post(self):
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length)
+        try:
+            data = json.loads(body)
+        except Exception:
+            self.json_response({"error": "Invalid JSON"})
+            return
+
+        config = charge_limit_config()
+        try:
+            stop = int(data.get("stop", config.get("STOP", 80)))
+            resume = int(data.get("resume", config.get("RESUME", 75)))
+        except (TypeError, ValueError):
+            self.json_response({"error": "Пороги должны быть числами"})
+            return
+        if not 50 <= stop <= 100:
+            self.json_response({"error": "Порог отключения: 50-100%"})
+            return
+        if not 5 <= resume < stop:
+            self.json_response({"error": "Порог возобновления должен быть меньше порога отключения"})
+            return
+        try:
+            write_charge_limit_config(stop, resume)
+        except OSError as error:
+            self.json_response({"error": "Не удалось записать конфиг: %s" % error})
+            return
+
+        if "enabled" in data:
+            action = "start" if data["enabled"] else "stop"
+            try:
+                result = subprocess.run(
+                    ["systemctl", action, CHARGE_LIMIT_SERVICE],
+                    timeout=20)
+            except Exception as error:
+                self.json_response({"error": "systemctl: %s" % error})
+                return
+            if result.returncode != 0:
+                self.json_response({"error": "systemctl %s failed" % action})
+                return
+            time.sleep(1)
+
+        battery = get_battery()
+        battery.update(get_battery_health())
+        battery["limit"] = get_charge_limit()
+        self.json_response({"ok": True, "battery": battery})
 
     def handle_config(self):
         name = self._query_param("name")
