@@ -890,10 +890,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .copy-btn:hover{background:#64748b}
 .toast{position:fixed;bottom:20px;right:20px;background:#22c55e;color:#000;padding:12px 20px;border-radius:8px;font-weight:500;display:none;z-index:200}
 .empty-state{text-align:center;padding:40px;color:#64748b}
-.settings-row{display:flex;gap:10px;align-items:center;margin-bottom:10px}
+.settings-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}
 .settings-row label{min-width:100px;color:#94a3b8;font-size:14px}
-.settings-row input{flex:1;padding:8px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;font-size:14px}
-.settings-row input.limit-input{flex:none;width:80px}
+.settings-row input{flex:1 1 160px;min-width:0;max-width:100%;padding:8px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;font-size:14px}
+.settings-row input.limit-input{flex:0 0 84px;width:84px;min-width:0}
+.settings-row .btn{flex:0 0 auto}
+.settings-row > div{min-width:0}
+.settings-inline{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+@media (max-width:480px){
+  .container{padding:0 14px}
+  .settings-row label{flex:1 1 100%;min-width:0}
+  .settings-row input{flex:1 1 150px}
+  .settings-row input.limit-input{flex:0 0 84px;width:84px}
+  .settings-inline{flex:1 1 100%}
+}
 .modal-btns{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
 .progress-bar{height:6px;background:#334155;border-radius:3px;margin-top:6px;overflow:hidden}
 .progress-bar .fill{height:100%;border-radius:3px;transition:width .5s ease}
@@ -1017,10 +1027,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     </div>
     <div class="settings-row" style="margin-top:10px">
       <label>Стоп / старт:</label>
-      <input class="limit-input" type="number" id="batStop" min="50" max="100" value="80">
-      <span style="color:#64748b">% /</span>
-      <input class="limit-input" type="number" id="batResume" min="5" max="99" value="75">
-      <span style="color:#64748b">%</span>
+      <div class="settings-inline">
+        <input class="limit-input" type="number" id="batStop" min="50" max="100" value="80">
+        <span style="color:#64748b">% /</span>
+        <input class="limit-input" type="number" id="batResume" min="5" max="99" value="75">
+        <span style="color:#64748b">%</span>
+      </div>
       <button class="btn btn-primary btn-sm" onclick="saveBatteryLimit()">Сохранить</button>
     </div>
     <div class="sys-sub" style="margin-top:8px">новые пороги применяются в течение 10 секунд</div>
